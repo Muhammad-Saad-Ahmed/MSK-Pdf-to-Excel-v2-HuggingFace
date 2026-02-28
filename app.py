@@ -6,7 +6,6 @@ Supports: HBL, Bank AL Habib, Meezan Bank
 import gc
 import os
 import re
-import signal
 import threading
 import uuid
 import zipfile
@@ -96,16 +95,7 @@ def detect_bank(text: str) -> str:
 # PDF Extraction
 # =============================================================================
 
-CHUNK_SIZE = 35   # pages per Excel part
-PAGE_TIMEOUT = 30  # seconds before a single stuck page is skipped
-
-
-class PageTimeoutError(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise PageTimeoutError("page extraction timed out")
+CHUNK_SIZE = 35  # pages per Excel part
 
 
 def get_pdf_page_count(pdf_path: str) -> int:
@@ -129,32 +119,22 @@ def _ocr_single_page(pdf_path: str, page_1idx: int) -> str:
 
 def extract_text_with_pdfplumber(pdf_path: str, start: int = 0, end: int = None) -> str:
     """Extract text from pages[start:end] (0-indexed).
-    Each page gets a SIGALRM watchdog. If pdfminer hangs on a page,
-    OCR is used for that specific page so no page is ever skipped.
+    On any page error, OCR is used for that page so nothing is lost.
+    No signals used — safe to call from background threads.
     """
     text_content = []
     pdf = None
     try:
         pdf = pdfplumber.open(pdf_path)
-        total = len(pdf.pages)
-        end_idx = end if end is not None else total
-        page_list = pdf.pages[start:end_idx]
+        end_idx = end if end is not None else len(pdf.pages)
 
-        for rel_idx, page in enumerate(page_list):
+        for rel_idx, page in enumerate(pdf.pages[start:end_idx]):
             abs_page_1idx = start + rel_idx + 1  # 1-indexed for pdf2image
             page_text = None
             try:
-                signal.signal(signal.SIGALRM, _timeout_handler)
-                signal.alarm(PAGE_TIMEOUT)
                 page_text = page.extract_text()
-                signal.alarm(0)
-            except PageTimeoutError:
-                signal.alarm(0)
-                # pdfminer hung — OCR this page so it is not lost
-                page_text = _ocr_single_page(pdf_path, abs_page_1idx)
             except Exception:
-                signal.alarm(0)
-                # other pdfplumber error — try OCR before giving up
+                # pdfplumber/pdfminer failed — OCR this page
                 page_text = _ocr_single_page(pdf_path, abs_page_1idx)
             finally:
                 del page
