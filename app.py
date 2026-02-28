@@ -6,6 +6,7 @@ Supports: HBL, Bank AL Habib, Meezan Bank
 import os
 import re
 import uuid
+import zipfile
 from pathlib import Path
 from io import BytesIO
 
@@ -89,45 +90,64 @@ def detect_bank(text: str) -> str:
 # PDF Extraction
 # =============================================================================
 
-def extract_text_with_pdfplumber(pdf_path: str) -> str:
+CHUNK_SIZE = 35  # pages per Excel part
+
+
+def get_pdf_page_count(pdf_path: str) -> int:
+    with pdfplumber.open(pdf_path) as pdf:
+        return len(pdf.pages)
+
+
+def extract_text_with_pdfplumber(pdf_path: str, start: int = 0, end: int = None) -> str:
+    """Extract text from pages[start:end] (0-indexed). Skips broken pages."""
     text_content = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text_content.append(page_text)
+            for page in pdf.pages[start:end]:
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_content.append(page_text)
+                except Exception:
+                    continue  # skip broken page, keep going
     except Exception as e:
         raise Exception(f"pdfplumber extraction failed: {str(e)}")
     return '\n'.join(text_content)
 
 
-def extract_text_with_ocr(pdf_path: str) -> str:
+def extract_text_with_ocr(pdf_path: str, first_page: int, last_page: int) -> str:
+    """OCR pages first_page..last_page (1-indexed, inclusive). Processes chunk at once."""
     text_content = []
     try:
-        images = convert_from_path(pdf_path, dpi=300)
+        # dpi=150 uses ~4x less memory than dpi=300; still readable for printed statements
+        images = convert_from_path(pdf_path, dpi=150, first_page=first_page, last_page=last_page)
         for image in images:
-            page_text = pytesseract.image_to_string(image, lang='eng')
-            if page_text:
-                text_content.append(page_text)
+            try:
+                page_text = pytesseract.image_to_string(image, lang='eng')
+                if page_text:
+                    text_content.append(page_text)
+            except Exception:
+                continue
+            finally:
+                del image  # release memory immediately
     except Exception as e:
         raise Exception(f"OCR extraction failed: {str(e)}")
     return '\n'.join(text_content)
 
 
-def extract_pdf_text(pdf_path: str) -> str:
-    text = ""
+def extract_chunk_text(pdf_path: str, start: int, end: int) -> str:
+    """Try pdfplumber first, fall back to OCR for pages[start:end] (0-indexed, end exclusive)."""
     try:
-        text = extract_text_with_pdfplumber(pdf_path)
+        text = extract_text_with_pdfplumber(pdf_path, start, end)
         if text and len(text.strip()) > 50:
             return text
     except Exception:
         pass
     try:
-        text = extract_text_with_ocr(pdf_path)
-        return text
+        # pdf2image uses 1-indexed pages
+        return extract_text_with_ocr(pdf_path, start + 1, end)
     except Exception as e:
-        raise Exception(f"All extraction methods failed: {str(e)}")
+        raise Exception(f"All extraction methods failed for pages {start+1}-{end}: {str(e)}")
 
 
 # =============================================================================
@@ -549,53 +569,91 @@ def convert_pdf():
         file.save(file_path)
 
         try:
-            text = extract_pdf_text(file_path)
+            total_pages = get_pdf_page_count(file_path)
         except Exception as e:
             os.remove(file_path)
-            return jsonify({'success': False, 'error': f'Failed to extract text: {str(e)}'}), 500
+            return jsonify({'success': False, 'error': f'Could not read PDF: {str(e)}'}), 500
 
-        if not text or len(text.strip()) < 10:
-            os.remove(file_path)
-            return jsonify({'success': False, 'error': 'No text could be extracted from PDF.'}), 500
+        bank_code = None
+        bank_name = None
+        all_excel_parts = []  # list of (filename, excel_bytes)
+        total_transactions = 0
 
-        bank_code = detect_bank(text)
-        if bank_code == 'unsupported':
-            os.remove(file_path)
-            return jsonify({'success': False, 'error': 'Unsupported bank. Supports HBL, Bank AL Habib, Meezan Bank.'}), 400
+        for part_num, start in enumerate(range(0, total_pages, CHUNK_SIZE), 1):
+            end = min(start + CHUNK_SIZE, total_pages)
 
-        bank_name = SUPPORTED_BANKS.get(bank_code, bank_code)
+            try:
+                chunk_text = extract_chunk_text(file_path, start, end)
+            except Exception:
+                continue  # skip unreadable chunk
 
-        try:
-            transactions = parse_statement(text, bank_code)
-        except Exception as e:
-            os.remove(file_path)
-            return jsonify({'success': False, 'error': f'Failed to parse statement: {str(e)}'}), 500
+            if not chunk_text or len(chunk_text.strip()) < 10:
+                continue
 
-        if not transactions:
-            os.remove(file_path)
-            return jsonify({'success': False, 'error': 'No transactions found.'}), 400
+            # Detect bank from first readable chunk only
+            if bank_code is None:
+                bank_code = detect_bank(chunk_text)
+                if bank_code == 'unsupported':
+                    os.remove(file_path)
+                    return jsonify({'success': False, 'error': 'Unsupported bank. Supports HBL, Bank AL Habib, Meezan Bank.'}), 400
+                bank_name = SUPPORTED_BANKS.get(bank_code, bank_code)
 
-        try:
-            excel_bytes = generate_excel(transactions, bank_name)
-        except Exception as e:
-            os.remove(file_path)
-            return jsonify({'success': False, 'error': f'Failed to generate Excel: {str(e)}'}), 500
+            try:
+                transactions = parse_statement(chunk_text, bank_code)
+            except Exception:
+                continue
+
+            if not transactions:
+                continue
+
+            try:
+                excel_bytes = generate_excel(transactions, bank_name)
+                safe_bank = bank_name.replace(' ', '_')
+                all_excel_parts.append((f"Part{part_num}_{safe_bank}.xlsx", excel_bytes))
+                total_transactions += len(transactions)
+            except Exception:
+                continue
 
         os.remove(file_path)
 
-        excel_filename = f"bank_statement_{uuid.uuid4().hex[:8]}.xlsx"
-        excel_path = os.path.join(app.config['UPLOAD_FOLDER'], excel_filename)
-        with open(excel_path, 'wb') as f:
-            f.write(excel_bytes)
+        if not all_excel_parts:
+            return jsonify({'success': False, 'error': 'No transactions found in the PDF.'}), 400
 
-        return jsonify({
-            'success': True,
-            'bank_detected': bank_name,
-            'transactions_count': len(transactions),
-            'download_filename': excel_filename
-        })
+        uid = uuid.uuid4().hex[:8]
+
+        if len(all_excel_parts) == 1:
+            out_filename = f"bank_statement_{uid}.xlsx"
+            out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_filename)
+            with open(out_path, 'wb') as f:
+                f.write(all_excel_parts[0][1])
+            return jsonify({
+                'success': True,
+                'bank_detected': bank_name,
+                'transactions_count': total_transactions,
+                'parts_count': 1,
+                'download_filename': out_filename,
+                'is_zip': False
+            })
+        else:
+            zip_filename = f"bank_statement_{uid}.zip"
+            zip_path = os.path.join(app.config['UPLOAD_FOLDER'], zip_filename)
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for name, data in all_excel_parts:
+                    zf.writestr(name, data)
+            return jsonify({
+                'success': True,
+                'bank_detected': bank_name,
+                'transactions_count': total_transactions,
+                'parts_count': len(all_excel_parts),
+                'download_filename': zip_filename,
+                'is_zip': True
+            })
 
     except Exception as e:
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
         return jsonify({'success': False, 'error': f'Unexpected error: {str(e)}'}), 500
 
 

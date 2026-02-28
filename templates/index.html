@@ -125,15 +125,20 @@
                                     <strong>Detected Bank:</strong>
                                     <span id="detected-bank" class="text-primary"></span>
                                 </p>
-                                <p class="mb-0">
+                                <p class="mb-1">
                                     <strong>Transactions Found:</strong>
                                     <span id="transaction-count"></span>
+                                </p>
+                                <p class="mb-0" id="parts-info" style="display:none">
+                                    <strong>Parts:</strong>
+                                    <span id="parts-count"></span>
+                                    <span class="text-muted small">(ZIP file contains all parts)</span>
                                 </p>
                             </div>
                             <div class="col-md-4 text-end">
                                 <a href="#" class="btn btn-success" id="download-btn">
                                     <i class="bi bi-download me-2"></i>
-                                    Download Excel
+                                    <span id="download-btn-label">Download Excel</span>
                                 </a>
                             </div>
                         </div>
@@ -369,6 +374,14 @@
                     detectedBank.textContent = data.bank_detected;
                     transactionCount.textContent = data.transactions_count;
                     downloadBtn.href = `/download/${data.download_filename}`;
+                    if (data.is_zip) {
+                        document.getElementById('download-btn-label').textContent = 'Download ZIP';
+                        document.getElementById('parts-count').textContent = data.parts_count;
+                        document.getElementById('parts-info').style.display = '';
+                    } else {
+                        document.getElementById('download-btn-label').textContent = 'Download Excel';
+                        document.getElementById('parts-info').style.display = 'none';
+                    }
                     successCard.classList.remove('d-none');
                     showAlert('PDF converted successfully!', 'success');
                 } else {
