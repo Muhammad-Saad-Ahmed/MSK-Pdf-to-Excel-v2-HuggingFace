@@ -3,6 +3,7 @@ Pakistani Bank Statement PDF to Excel Converter
 Supports: HBL, Bank AL Habib, Meezan Bank
 """
 
+import gc
 import os
 import re
 import uuid
@@ -101,17 +102,24 @@ def get_pdf_page_count(pdf_path: str) -> int:
 def extract_text_with_pdfplumber(pdf_path: str, start: int = 0, end: int = None) -> str:
     """Extract text from pages[start:end] (0-indexed). Skips broken pages."""
     text_content = []
+    pdf = None
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages[start:end]:
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_content.append(page_text)
-                except Exception:
-                    continue  # skip broken page, keep going
+        pdf = pdfplumber.open(pdf_path)
+        for page in pdf.pages[start:end]:
+            try:
+                page_text = page.extract_text()
+                if page_text:
+                    text_content.append(page_text)
+            except Exception:
+                continue  # skip broken page, keep going
+            finally:
+                del page
+                gc.collect()
     except Exception as e:
         raise Exception(f"pdfplumber extraction failed: {str(e)}")
+    finally:
+        if pdf is not None:
+            pdf.close()
     return '\n'.join(text_content)
 
 
@@ -585,6 +593,7 @@ def convert_pdf():
             try:
                 chunk_text = extract_chunk_text(file_path, start, end)
             except Exception:
+                gc.collect()
                 continue  # skip unreadable chunk
 
             if not chunk_text or len(chunk_text.strip()) < 10:
@@ -594,7 +603,6 @@ def convert_pdf():
             if bank_code is None:
                 bank_code = detect_bank(chunk_text)
                 if bank_code == 'unsupported':
-                    os.remove(file_path)
                     return jsonify({'success': False, 'error': 'Unsupported bank. Supports HBL, Bank AL Habib, Meezan Bank.'}), 400
                 bank_name = SUPPORTED_BANKS.get(bank_code, bank_code)
 
@@ -602,6 +610,9 @@ def convert_pdf():
                 transactions = parse_statement(chunk_text, bank_code)
             except Exception:
                 continue
+            finally:
+                del chunk_text
+                gc.collect()
 
             if not transactions:
                 continue
@@ -613,8 +624,9 @@ def convert_pdf():
                 total_transactions += len(transactions)
             except Exception:
                 continue
-
-        os.remove(file_path)
+            finally:
+                del transactions
+                gc.collect()
 
         if not all_excel_parts:
             return jsonify({'success': False, 'error': 'No transactions found in the PDF.'}), 400
@@ -650,11 +662,14 @@ def convert_pdf():
             })
 
     except Exception as e:
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
         return jsonify({'success': False, 'error': f'Unexpected error: {str(e)}'}), 500
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        gc.collect()
 
 
 @app.route('/download/<filename>')
